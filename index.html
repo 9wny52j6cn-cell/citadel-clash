@@ -14,6 +14,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.min.js" defer></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js" defer></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.1.0/paho-mqtt.min.js" defer></script>
 <style>
 /* Layout: one-screen arcade app. HUD strip on top, a letterboxed 400x640 field in the middle, a 7-button build bar at the bottom. Single dark neon theme by design. */
 :root{color-scheme:dark;
@@ -175,7 +176,9 @@ const COST_MULT=1.5, DECAY_COOLDOWN=4, DECAY_EVERY=2, DECAY_AMT=5;
 const AI_SPEED=222, AI_LERP=0.18, AI_OFF_MAX=0.25, AI_OFF_EVERY=2.2;
 const AUTO_SPEED=576, AUTO_OFF_MAX=0.45, AUTO_OFF_EVERY=1.9;
 const AI={PRIORITY_GENS:4,MAX_GENS:10,WALLS_PER_GEN:3,WALLS_PER_BAY:2,WALLS_PER_CANNON:1,BAY_MIN_STRUCTS:4,BAY_BUFFER:30,MAX_BAYS:4,MAX_CANNONS:4,FORWARD_WALL_ENERGY:120,GEN_EXPAND_BUFFER:100,SURPLUS:600,FB_MIN_GENS:3,FB_SCORE_MIN:2.5,FR_BUFFER:50,FR_MIN_GENS:2};
-const SNAP_HZ={peer:30,room:20};
+const SNAP_HZ={peer:30,room:20,relay:20};
+const STRUCT_RESEND=1.5;
+const DIRECT_HEAD_START=3;
 const CODE_ALPHABET='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
 const clamp=(v,a,b)=>v<a?a:v>b?b:v;
@@ -194,7 +197,7 @@ function makePlayer(id){
 function makeSim(aiFor){
   const S={t:0,p1:makePlayer('p1'),p2:makePlayer('p2'),
     ball:{x:CX,y:CY,dx:0,dy:0,speed:BALL_SPEED0,owner:'p2',frozenUntil:0,dmg:1,lastHit:null,serveAt:0},
-    structures:[],vehicles:[],projectiles:[],events:[],winner:null,nextId:1,rally:0,ecoAcc:0,decayAcc:0,aiSaving:false,ai:aiFor||null};
+    structures:[],vehicles:[],projectiles:[],events:[],winner:null,nextId:1,rally:0,ecoAcc:0,decayAcc:0,aiSaving:false,ai:aiFor||null,sv:1};
   serve(S,'p2');
   return S;
 }
@@ -225,7 +228,7 @@ function placeStructure(S,owner,type,x,y){
   if(pl.energy<d.cost||overlapsRect(S,x,y,d.w,d.h))return null;
   pl.energy-=d.cost;
   const s={id:S.nextId++,type,owner,x,y,w:d.w,h:d.h,hp:d.hp,maxHp:d.hp,frozenUntil:0,nextFire:type==='cannon'?S.t:0};
-  S.structures.push(s);
+  S.structures.push(s);S.sv++;
   if(type==='repair_bay')spawnVehicle(S,s);
   S.events.push(['snd','build']);S.events.push(['fx','build',s.x+s.w/2,s.y+s.h/2]);
   return s;
@@ -251,7 +254,7 @@ function activateFreeze(S,owner,tx,ty){
   if(sqHits(foe.x,foe.y,foe.w,foe.h,tx,ty,R))foe.frozenUntil=until;
   for(const v of S.vehicles)if(v.owner===op&&sqHits(v.x,v.y,v.w,v.h,tx,ty,R))v.frozenUntil=until;
   for(const p of S.projectiles)if(p.type==='bolt'&&p.owner===op&&sqHits(p.x-BOLT.w/2,p.y-BOLT.h/2,BOLT.w,BOLT.h,tx,ty,R))p.frozenUntil=until;
-  for(const s of S.structures)if(s.owner===op){const d=Math.hypot(s.x+s.w/2-tx,s.y+s.h/2-ty);if(d<R+Math.max(s.w,s.h)/2){s.hp-=FREEZE.dmg;s.frozenUntil=until;S.events.push(['hit',s.id]);}}
+  for(const s of S.structures)if(s.owner===op){const d=Math.hypot(s.x+s.w/2-tx,s.y+s.h/2-ty);if(d<R+Math.max(s.w,s.h)/2){s.hp-=FREEZE.dmg;s.frozenUntil=until;S.sv++;S.events.push(['hit',s.id]);}}
   S.projectiles.push({id:S.nextId++,type:'freeze',x:tx,y:ty,r:0,alpha:0.35,born:S.t,dur:FREEZE.dur});
   S.events.push(['snd','freeze']);S.events.push(['fx','freeze',tx,ty]);
   return true;
@@ -327,7 +330,7 @@ function stepBall(S,dt){
     if(s.owner===b.owner)continue;
     const cx=clamp(b.x,s.x,s.x+s.w),cy=clamp(b.y,s.y,s.y+s.h),dx=b.x-cx,dy=b.y-cy;
     if(dx*dx+dy*dy>BALL_R*BALL_R)continue;
-    s.hp-=b.dmg;S.rally++;bumpSpeed(S);
+    s.hp-=b.dmg;S.sv++;S.rally++;bumpSpeed(S);
     const ox=(b.x-(s.x+s.w/2))/(s.w/2+BALL_R),oy=(b.y-(s.y+s.h/2))/(s.h/2+BALL_R);
     if(Math.abs(ox)>Math.abs(oy)){b.dx=(ox>0?1:-1)*Math.abs(b.dx);b.x=ox>0?s.x+s.w+BALL_R+0.5:s.x-BALL_R-0.5;b.dy+=(Math.random()-0.5)*HIT_RANDOM;}
     else{b.dy=(oy>0?1:-1)*Math.abs(b.dy);b.y=oy>0?s.y+s.h+BALL_R+0.5:s.y-BALL_R-0.5;b.dx+=(Math.random()-0.5)*HIT_RANDOM;}
@@ -359,7 +362,7 @@ function stepVehicles(S,dt){
       v.repairT+=dt;
       if(v.repairT>=VEH.repairTime){
         v.repairT=0;const tg=S.structures.find(s=>s.id===v.targetId&&s.owner===v.owner);
-        if(tg&&tg.hp<tg.maxHp){tg.hp+=1;v.charges-=1;S.events.push(['snd','repair']);S.events.push(['fx','repair',tg.x+tg.w/2,tg.y+tg.h/2]);if(tg.hp>=tg.maxHp||v.charges<=0){v.repairing=false;v.targetId=null;}}
+        if(tg&&tg.hp<tg.maxHp){tg.hp+=1;S.sv++;v.charges-=1;S.events.push(['snd','repair']);S.events.push(['fx','repair',tg.x+tg.w/2,tg.y+tg.h/2]);if(tg.hp>=tg.maxHp||v.charges<=0){v.repairing=false;v.targetId=null;}}
         else{v.repairing=false;v.targetId=null;}
       }
       if(v.charges<=0){v.repairing=false;v.targetId=null;v.returning=true;}
@@ -397,7 +400,7 @@ function stepProjectiles(S,dt){
         if(p.progress>=1){
           p.progress=1;p.exploded=true;p.x=p.tx;p.y=p.ty;p.doneAt=S.t+0.3;
           const op=other(p.owner);
-          for(const s of S.structures){if(s.owner!==op)continue;const d=Math.hypot(s.x+s.w/2-p.tx,s.y+s.h/2-p.ty);if(d<FIREBALL.aoe+Math.max(s.w,s.h)/2){s.hp-=FIREBALL.dmg;S.events.push(['hit',s.id]);}}
+          for(const s of S.structures){if(s.owner!==op)continue;const d=Math.hypot(s.x+s.w/2-p.tx,s.y+s.h/2-p.ty);if(d<FIREBALL.aoe+Math.max(s.w,s.h)/2){s.hp-=FIREBALL.dmg;S.sv++;S.events.push(['hit',s.id]);}}
           S.events.push(['snd','explode']);S.events.push(['fx','explode',p.tx,p.ty]);
         }else{
           const q=p.progress;p.x=p.sx+(p.tx-p.sx)*q;
@@ -413,7 +416,7 @@ function stepProjectiles(S,dt){
         const op=other(p.owner);
         for(const s of S.structures){
           if(s.owner===op&&p.x>s.x&&p.x<s.x+s.w&&p.y>s.y&&p.y<s.y+s.h){
-            s.hp-=BOLT.dmg;S.events.push(['snd','struct']);S.events.push(['hit',s.id]);S.events.push(['fx','spark',p.x,p.y,p.owner]);remove=true;break;
+            s.hp-=BOLT.dmg;S.sv++;S.events.push(['snd','struct']);S.events.push(['hit',s.id]);S.events.push(['fx','spark',p.x,p.y,p.owner]);remove=true;break;
           }
         }
         if(!remove&&(p.y<-BOLT.h*2||p.y>H+BOLT.h*2))remove=true;
@@ -429,7 +432,7 @@ function stepProjectiles(S,dt){
 function removeDead(S){
   for(let i=S.structures.length-1;i>=0;i--){
     const s=S.structures[i];if(s.hp>0)continue;
-    S.structures.splice(i,1);
+    S.structures.splice(i,1);S.sv++;
     S.events.push(['boom',s.x+s.w/2,s.y+s.h/2,s.type,s.owner,s.w,s.h]);S.events.push(['snd','destroy']);
     if(s.type==='repair_bay')for(let j=S.vehicles.length-1;j>=0;j--)if(S.vehicles[j].bayId===s.id)S.vehicles.splice(j,1);
   }
@@ -526,24 +529,24 @@ function aiThink(S){
 const r1=v=>Math.round(v*10)/10,r2=v=>Math.round(v*100)/100,r3=v=>Math.round(v*1000)/1000;
 const own=n=>n===1?'p1':'p2';
 function encP(p){return[r1(p.x),Math.floor(p.energy),p.score,r2(p.frozenUntil),Math.round(p.fbCost),Math.round(p.frCost),p.touching?1:0];}
-function encode(S,meta){
+function encode(S,meta,withS){
   const b=S.ball;
   const o={st:r3(S.t),b:[r1(b.x),r1(b.y),r3(b.dx),r3(b.dy),r1(b.speed),b.owner==='p1'?1:2,r2(b.frozenUntil),b.dmg,r2(b.serveAt),S.rally],
     p1:encP(S.p1),p2:encP(S.p2),
-    S:S.structures.map(s=>[s.id,TYPE_IDX[s.type],s.owner==='p1'?1:2,r1(s.x),r1(s.y),s.hp,r2(s.frozenUntil)]),
     V:S.vehicles.map(v=>[v.id,v.owner==='p1'?1:2,r1(v.x),r1(v.y),v.charges,v.restocking?r2(v.restockT/(VEH.charges*VEH.restockPerCharge)):0,v.bayId,r2(v.frozenUntil)]),
     P:S.projectiles.map(p=>p.type==='fireball'?[1,p.owner==='p1'?1:2,r1(p.x),r1(p.y),r2(p.scale),p.exploded?1:0]:p.type==='bolt'?[2,p.owner==='p1'?1:2,r1(p.x),r1(p.y),r1(p.dx),r1(p.dy),r2(p.a),r2(p.frozenUntil)]:[3,r1(p.x),r1(p.y),r1(p.r),r2(p.alpha)]),
     w:S.winner||0};
+  if(withS!==false)o.S=S.structures.map(s=>[s.id,TYPE_IDX[s.type],s.owner==='p1'?1:2,r1(s.x),r1(s.y),s.hp,r2(s.frozenUntil)]);
   for(const k in meta)o[k]=meta[k];
   return o;
 }
-function decode(m){
+function decode(m,prevStructures){
   const a=m.b;
   const dp=(q,id)=>({id,x:q[0],y:id==='p1'?P1_Y:P2_Y,w:PADDLE_W,h:PADDLE_H,energy:q[1],score:q[2],frozenUntil:q[3],fbCost:q[4],frCost:q[5],touching:!!q[6]});
   return{t:m.st,rally:a[9],
     ball:{x:a[0],y:a[1],dx:a[2],dy:a[3],speed:a[4],owner:own(a[5]),frozenUntil:a[6],dmg:a[7],serveAt:a[8]},
     p1:dp(m.p1,'p1'),p2:dp(m.p2,'p2'),
-    structures:m.S.map(q=>{const type=TYPE_LIST[q[1]],d=TYPES[type];return{id:q[0],type,owner:own(q[2]),x:q[3],y:q[4],w:d.w,h:d.h,hp:q[5],maxHp:d.hp,frozenUntil:q[6]};}),
+    structures:m.S?m.S.map(q=>{const type=TYPE_LIST[q[1]],d=TYPES[type];return{id:q[0],type,owner:own(q[2]),x:q[3],y:q[4],w:d.w,h:d.h,hp:q[5],maxHp:d.hp,frozenUntil:q[6]};}):(prevStructures||[]),
     vehicles:m.V.map(q=>({id:q[0],owner:own(q[1]),x:q[2],y:q[3],w:VEH.w,h:VEH.h,charges:q[4],restocking:q[5]>0,restockFrac:q[5],bayId:q[6],frozenUntil:q[7]})),
     projectiles:m.P.map(q=>q[0]===1?{type:'fireball',owner:own(q[1]),x:q[2],y:q[3],scale:q[4],exploded:!!q[5]}:q[0]===2?{type:'bolt',owner:own(q[1]),x:q[2],y:q[3],dx:q[4],dy:q[5],a:q[6],frozenUntil:q[7]}:{type:'freeze',x:q[1],y:q[2],r:q[3],alpha:q[4]}),
     winner:m.w||null};
@@ -896,7 +899,7 @@ class PeerTransport{
       peer.on('open',()=>{if(settled)return;settled=true;clearTimeout(timer);resolve(code);});
       peer.on('error',e=>{if(!settled){settled=true;clearTimeout(timer);reject(e);}});
       peer.on('connection',c=>{
-        if(this.conn){c.on('open',()=>{try{c.send({t:'full'});}catch(x){}setTimeout(()=>{try{c.close();}catch(x){}},400);});return;}
+        if(this.conn){c.on('open',()=>{try{c.send({k:'full'});}catch(x){}setTimeout(()=>{try{c.close();}catch(x){}},400);});return;}
         this.conn=c;this.wire(c,null);
       });
     });
@@ -954,6 +957,69 @@ class RoomTransport{
   close(){this.closed=true;for(const u of this.unsub){try{u();}catch(e){}}this.unsub=[];if(this.room){try{this.room.leave().catch(()=>{});}catch(e){}this.room=null;}}
 }
 
+const RELAYS=[{uri:'wss://broker.emqx.io:8084/mqtt'},{uri:'wss://broker.hivemq.com:8884/mqtt'},{uri:'wss://test.mosquitto.org:8081/mqtt'}];
+class RelayTransport{
+  constructor(){this.kind='relay';this.client=null;this.role=null;this.code=null;this.other=null;this.me='r'+Math.random().toString(36).slice(2,10);this.onMsg=null;this.onJoin=null;this.onLeave=null;this.closed=false;this.welcome=null;}
+  static available(){return typeof Paho!=='undefined'&&!!Paho.Client;}
+  topics(){const b='citadel/'+this.code.toLowerCase();return{h:b+'/h',g:b+'/g'};}
+  connectBroker(){
+    return new Promise((resolve,reject)=>{
+      const relays=(window.__RELAYS&&window.__RELAYS.length)?window.__RELAYS:RELAYS;let i=0;
+      const tryNext=()=>{
+        if(this.closed)return reject(new Error('closed'));
+        if(i>=relays.length)return reject(new Error('relay'));
+        const r=relays[i++];let c;
+        try{c=new Paho.Client(r.uri,this.me+'-'+Math.random().toString(36).slice(2,6));}catch(e){return tryNext();}
+        c.onMessageArrived=m=>this.recv(m);
+        c.onConnectionLost=()=>{if(this.client===c&&!this.closed){this.client=null;if(this.onLeave)this.onLeave();}};
+        try{c.connect({timeout:6,keepAliveInterval:20,useSSL:/^wss:/i.test(r.uri),mqttVersion:4,cleanSession:true,onSuccess:()=>{if(this.closed){try{c.disconnect();}catch(e){}return reject(new Error('closed'));}this.client=c;resolve(c);},onFailure:()=>tryNext()});}
+        catch(e){tryNext();}
+      };
+      tryNext();
+    });
+  }
+  async host(code){this.role='host';this.code=code;await this.connectBroker();this.client.subscribe(this.topics().g,{qos:0});return code;}
+  async join(code){
+    this.role='guest';this.code=code;await this.connectBroker();this.client.subscribe(this.topics().h,{qos:0});
+    return new Promise((resolve,reject)=>{
+      let settled=false;
+      const timer=setTimeout(()=>{if(!settled){settled=true;reject(new Error('nohost'));}},8000);
+      this.welcome=()=>{if(!settled){settled=true;clearTimeout(timer);resolve();}};
+      const hello=()=>{if(settled||this.closed)return;this.pub(this.topics().g,{k:'hello',id:this.me});setTimeout(hello,1200);};
+      hello();
+    });
+  }
+  recv(m){
+    let d;try{d=JSON.parse(m.payloadString);}catch(e){return;}
+    if(!d||typeof d!=='object')return;
+    const t=this.topics();
+    if(this.role==='host'){
+      if(d.k==='hello'){
+        if(!this.other){this.other=d.id;this.pub(t.h,{k:'welcome',id:d.id});if(this.onJoin)this.onJoin();}
+        else if(d.id===this.other)this.pub(t.h,{k:'welcome',id:d.id});
+        else this.pub(t.h,{k:'full',id:d.id});
+        return;
+      }
+      if(d.id!==this.other)return;
+      if(d.k==='bye'){this.other=null;if(!this.closed&&this.onLeave)this.onLeave();return;}
+      if(this.onMsg)this.onMsg(d);
+    }else{
+      if(d.k==='welcome'){if(d.id===this.me){this.other='host';if(this.welcome)this.welcome();}return;}
+      if(d.k==='full'){if(d.id===this.me&&this.onMsg)this.onMsg({k:'full'});return;}
+      if(d.k==='bye'){if(!this.closed&&this.onLeave)this.onLeave();return;}
+      if(this.onMsg)this.onMsg(d);
+    }
+  }
+  pub(topic,o){if(!this.client)return;try{this.client.send(topic,JSON.stringify(o),0,false);}catch(e){}}
+  send(o){if(!this.code)return;const t=this.topics();if(this.role==='host')this.pub(t.h,o);else{o.id=this.me;this.pub(t.g,o);}}
+  close(){
+    if(this.closed)return;this.closed=true;
+    const c=this.client;if(!c)return;
+    try{if(this.code&&this.other){const t=this.topics();this.pub(this.role==='host'?t.h:t.g,this.role==='host'?{k:'bye'}:{k:'bye',id:this.me});}}catch(e){}
+    this.client=null;setTimeout(()=>{try{c.disconnect();}catch(e){}},200);
+  }
+}
+
 /* ============================================================
    APP STATE, UI, INPUT, MAIN LOOP
    ============================================================ */
@@ -963,7 +1029,7 @@ const UI={e1:$('e1'),e2:$('e2'),s1:$('s1'),s2:$('s2'),lbl2:$('lbl2'),banner:$('b
   bar:Array.from(document.querySelectorAll('#bar .bb')),hud:{}};
 const App={mode:null,viewer:'p1',phase:'menu',S:null,net:null,G:null,sel:null,ghost:null,paused:false,acc:0,myX:CX-PADDLE_W/2,touching:false,touchedOnce:false,playStart:0,
   pointers:new Map(),activePaddle:null,mouseTimer:0,netEvents:[],seq:0,epoch:0,sendAcc:0,ready:{p1:false,p2:false},guestIn:null,guestSeen:0,guestTs:0,lastAck:0,
-  pendingCmds:[],nextCmdId:1,roomPromise:null,inArtifact:false,lastSnapAt:0,code:null};
+  pendingCmds:[],nextCmdId:1,roomPromise:null,inArtifact:false,lastSnapAt:0,code:null,sentSv:0,sentSvAt:0,cands:[],attempt:{live:false}};
 const inFrame=()=>!!(window.claude&&typeof window.claude.use==='function');
 
 function updateSoundButton(){UI.btnSound.textContent=Sfx.on?'🔊':'🔇';}
@@ -1159,9 +1225,10 @@ function requestRematch(){
 }
 function maybeRestart(){
   if(App.mode!=='host'||App.phase!=='over')return;
-  if(App.ready.p1&&App.ready.p2){App.epoch++;App.ready.p1=App.ready.p2=false;App.S=makeSim(null);App.lastAck=0;enterPlay('THEM');}
+  if(App.ready.p1&&App.ready.p2){App.epoch++;App.ready.p1=App.ready.p2=false;App.S=makeSim(null);App.lastAck=0;App.sentSv=0;enterPlay('THEM');}
 }
 function toMenu(){
+  App.attempt.live=false;closeCands(null);
   if(App.net){try{App.net.close();}catch(e){}App.net=null;}
   App.mode=null;App.phase='menu';App.S=null;App.G=null;App.sel=null;App.ghost=null;
   hideOverlays();hideBanner();UI.menu.hidden=false;UI.lobby.innerHTML='';
@@ -1190,6 +1257,10 @@ document.addEventListener('visibilitychange',()=>{
 });
 
 /* ----- multiplayer: lobby ----- */
+function libsReady(){
+  if(document.readyState==='complete')return Promise.resolve();
+  return new Promise(res=>{const t=setTimeout(res,4000);window.addEventListener('load',()=>{clearTimeout(t);res();},{once:true});});
+}
 function getRoom(){
   if(!inFrame())return Promise.resolve(null);
   App.inArtifact=true;
@@ -1213,6 +1284,7 @@ function transportError(e){
   if(t==='browser-incompatible')return'This browser cannot make peer connections.';
   if(t==='timeout')return'Timed out while connecting. Try again.';
   if(t==='room'||t==='not_permitted'||t==='not_granted')return'This account cannot open a game room here.';
+  if(t==='relay')return'Could not reach a direct link or any relay server. Check both phones have internet and try again.';
   return'Connection failed'+(t?' ('+t+')':'')+'.';
 }
 function lobbyHtml(inner){UI.lobby.innerHTML=inner;UI.menu.hidden=true;UI.lobby.hidden=false;App.phase='lobby';}
@@ -1220,23 +1292,21 @@ function joinUrl(code){
   if(App.inArtifact||!/^https?:/.test(location.protocol))return null;
   return location.origin+location.pathname+location.search+'#join-'+code;
 }
-async function startHost(){
-  lobbyHtml('<h2>Host a game</h2><p class="status" id="lbStatus"><span class="dot"></span>Setting up…</p><button class="btn small" id="lbCancel">Cancel</button>');
-  $('lbCancel').addEventListener('click',()=>toMenu());
-  let T;try{T=await pickTransport();}catch(e){lobbyFail(transportError(e));return;}
-  App.net=T;App.mode='host';App.viewer='p1';
-  T.onJoin=()=>{if(App.phase!=='lobby')return;const st=$('lbStatus');if(st)st.innerHTML='<span class="dot on"></span>Player connected. Starting…';App.guestSeen=nowSec();setTimeout(()=>{if(App.net===T&&App.phase==='lobby')beginHosted();},900);};
+function closeCands(except){for(const c of App.cands){if(c!==except){try{c.close();}catch(e){}}}App.cands=[];}
+function wireHost(T){
+  T.onJoin=()=>{
+    if(App.net&&App.net!==T){try{T.close();}catch(e){}return;}
+    App.net=T;closeCands(T);App.attempt.live=false;
+    try{T.send({k:'adopt',via:T.kind});}catch(e){}
+    if(App.phase!=='lobby')return;
+    const st=$('lbStatus');if(st)st.innerHTML='<span class="dot on"></span>Player connected'+(T.kind==='relay'?' (relay)':'')+'. Starting…';
+    App.guestSeen=nowSec();setTimeout(()=>{if(App.net===T&&App.phase==='lobby')beginHosted();},900);
+  };
   T.onLeave=()=>{if(App.net!==T)return;if(App.phase==='play'||App.phase==='over'){App.paused=true;showModal('Opponent left','The connection to the other phone closed.',[{label:'Menu',primary:true,onClick:()=>toMenu()}]);}else{const st=$('lbStatus');if(st)st.innerHTML='<span class="dot"></span>Player left. Waiting for a player…';}};
-  T.onMsg=onGuestMessage;
-  T.onError=()=>{if(App.net!==T)return;App.paused=true;showModal('Cannot host from this account','This account is not allowed to send game updates here. Host from the phone that owns the game, or share it with edit access.',[{label:'Menu',primary:true,onClick:()=>toMenu()}]);};
-  let code=null;
-  for(let attempt=0;attempt<4&&!code;attempt++){
-    const c=genCode();
-    try{await T.host(c);code=c;}
-    catch(e){if(!(e&&e.type==='unavailable-id')||attempt===3){lobbyFail(transportError(e));return;}}
-  }
-  if(App.net!==T)return;
-  App.code=code;
+  T.onMsg=m=>{if(App.net===T)onGuestMessage(m);};
+  if(T.kind==='room')T.onError=()=>{if(App.net!==T)return;App.paused=true;showModal('Cannot host from this account','This account is not allowed to send game updates here. Host from the phone that owns the game, or share it with edit access.',[{label:'Menu',primary:true,onClick:()=>toMenu()}]);};
+}
+function hostLobbyHtml(code){
   const url=joinUrl(code);
   let html='<h2>Your room code</h2><div class="code">'+code+'</div>'+
     '<p>On the other iPhone: open this same game, tap <b>Join a 2-phone game</b> and type the code.</p>';
@@ -1254,7 +1324,37 @@ async function startHost(){
     });
   }
 }
+async function startHost(){
+  lobbyHtml('<h2>Host a game</h2><p class="status" id="lbStatus"><span class="dot"></span>Setting up…</p><button class="btn small" id="lbCancel">Cancel</button>');
+  $('lbCancel').addEventListener('click',()=>toMenu());
+  App.mode='host';App.viewer='p1';App.net=null;App.cands=[];
+  const at={live:true};App.attempt=at;
+  await libsReady();
+  const ns=await getRoom();
+  if(App.phase!=='lobby'||!at.live)return;
+  if(ns){
+    const T=new RoomTransport(ns);App.cands=[T];wireHost(T);
+    let code=null;
+    for(let attempt=0;attempt<4&&!code;attempt++){const c=genCode();try{await T.host(c);code=c;}catch(e){if(attempt===3){lobbyFail(transportError(e));return;}}}
+    if(App.phase!=='lobby'||!App.cands.includes(T))return;
+    App.code=code;hostLobbyHtml(code);return;
+  }
+  if(App.inArtifact){lobbyFail(transportError({type:'needsignin'}));return;}
+  const direct=PeerTransport.available()?new PeerTransport():null;
+  const relay=RelayTransport.available()?new RelayTransport():null;
+  if(!direct&&!relay){lobbyFail(transportError({type:'nolib'}));return;}
+  const code=genCode();App.code=code;
+  App.cands=[direct,relay].filter(Boolean);
+  for(const c of App.cands)wireHost(c);
+  let ready=0,failed=0,shown=false;
+  const onReady=()=>{if(!at.live)return;ready++;if(!shown&&App.phase==='lobby'){shown=true;hostLobbyHtml(code);}};
+  const onFail=(T,e)=>{if(!at.live)return;failed++;App.cands=App.cands.filter(c=>c!==T);try{T.close();}catch(x){}if(!ready&&failed>=(direct?1:0)+(relay?1:0)&&App.phase==='lobby')lobbyFail(transportError(e));};
+  if(direct)direct.host(code).then(onReady,e=>onFail(direct,e));
+  if(relay)relay.host(code).then(onReady,e=>onFail(relay,e));
+}
 function lobbyFail(msg){
+  App.attempt.live=false;
+  closeCands(null);
   if(App.net){try{App.net.close();}catch(e){}App.net=null;}
   App.mode=null;
   lobbyHtml('<h2>Could not connect</h2><p class="status err">'+msg+'</p><button class="btn" id="lbBack">Back</button>');
@@ -1269,22 +1369,49 @@ function showJoin(prefill){
   $('lbJoin').addEventListener('click',()=>{const code=cleanCode(inp.value);if(code.length!==4){$('lbStatus').textContent='The code has 4 characters.';return;}startJoin(code);});
   if(cleanCode(prefill).length===4)startJoin(cleanCode(prefill));else setTimeout(()=>{try{inp.focus();}catch(e){}},50);
 }
+function guestAdopt(T){
+  if(App.net)return;
+  App.net=T;closeCands(T);App.attempt.live=false;
+  const st=$('lbStatus');if(st)st.innerHTML='<span class="dot on"></span>Connected'+(T.kind==='relay'?' (relay)':'')+'. Waiting for the host to start…';
+  App.guestIn=null;App.G.lastSend=0;
+}
+function wireGuest(T){
+  T.onMsg=m=>{if(m&&m.k==='full'){if(App.attempt.live)lobbyFail('That game already has two players.');return;}if(!App.net&&App.attempt.live)guestAdopt(T);if(App.net===T)onHostMessage(m);};
+  T.onLeave=()=>{if(App.net!==T)return;if(App.phase==='play'||App.phase==='over')showModal('Connection lost','The host phone disconnected.',[{label:'Menu',primary:true,onClick:()=>toMenu()}]);else lobbyFail('The host left.');};
+}
 async function startJoin(code){
   const st=$('lbStatus'),btn=$('lbJoin');if(btn)btn.disabled=true;
   if(st){st.classList.remove('err');st.innerHTML='<span class="dot"></span>Connecting to '+code+'…';}
-  let T;try{T=await pickTransport();}catch(e){lobbyFail(transportError(e));return;}
-  App.net=T;App.mode='guest';App.viewer='p2';App.code=code;
-  App.G={cur:null,q:0,recvAt:0,epoch:null,ready:false,rtt:0,lastSend:0,lastSentX:null};
+  App.mode='guest';App.viewer='p2';App.code=code;App.net=null;App.cands=[];
+  const at={live:true};App.attempt=at;
+  App.G={cur:null,q:0,sq:0,recvAt:0,epoch:null,ready:false,rtt:0,lastSend:0,lastSentX:null};
   App.pendingCmds=[];App.nextCmdId=1;
-  T.onMsg=onHostMessage;
-  T.onLeave=()=>{if(App.net!==T)return;if(App.phase==='play'||App.phase==='over')showModal('Connection lost','The host phone disconnected.',[{label:'Menu',primary:true,onClick:()=>toMenu()}]);else lobbyFail('The host left.');};
-  try{await T.join(code);}catch(e){if(App.net===T)lobbyFail(transportError(e));return;}
-  if(App.net!==T)return;
-  if(st)st.innerHTML='<span class="dot on"></span>Connected. Waiting for the host to start…';
-  App.guestIn=null;App.G.lastSend=0;
+  await libsReady();
+  const ns=await getRoom();
+  if(App.phase!=='lobby'||!at.live)return;
+  if(ns){
+    const T=new RoomTransport(ns);App.cands=[T];wireGuest(T);
+    try{await T.join(code);}catch(e){if(App.cands.includes(T))lobbyFail(transportError(e));return;}
+    if(App.phase==='lobby'&&App.cands.includes(T))guestAdopt(T);
+    return;
+  }
+  if(App.inArtifact){lobbyFail(transportError({type:'needsignin'}));return;}
+  const direct=PeerTransport.available()?new PeerTransport():null;
+  const relay=RelayTransport.available()?new RelayTransport():null;
+  if(!direct&&!relay){lobbyFail(transportError({type:'nolib'}));return;}
+  App.cands=[direct,relay].filter(Boolean);
+  for(const c of App.cands)wireGuest(c);
+  let lastErr=null,relayStarted=false;
+  const fail=(T,e)=>{if(!at.live)return;lastErr=e;App.cands=App.cands.filter(c=>c!==T);try{T.close();}catch(x){}const conclusive=T===relay&&e&&e.message==='nohost';if((conclusive||!App.cands.length)&&!App.net&&App.phase==='lobby')lobbyFail(transportError(lastErr||{type:'timeout'}));};
+  setTimeout(()=>{if(at.live&&!App.net&&App.phase==='lobby')lobbyFail(transportError({type:'timeout'}));},30000);
+  const startRelay=()=>{if(!relay||relayStarted||!at.live||App.net||App.phase!=='lobby')return;relayStarted=true;if(st&&!App.net)st.innerHTML='<span class="dot"></span>Connecting to '+code+' via relay…';relay.join(code).then(()=>{},e=>fail(relay,e));};
+  if(direct){
+    direct.join(code).then(()=>{},e=>{fail(direct,e);startRelay();});
+    if(relay)setTimeout(startRelay,DIRECT_HEAD_START*1000);
+  }else startRelay();
 }
 function beginHosted(){
-  App.epoch++;App.S=makeSim(null);App.ready={p1:false,p2:false};App.lastAck=0;App.guestIn=null;App.guestSeen=nowSec();App.seq=0;App.netEvents=[];
+  App.epoch++;App.S=makeSim(null);App.sentSv=0;App.ready={p1:false,p2:false};App.lastAck=0;App.guestIn=null;App.guestSeen=nowSec();App.seq=0;App.netEvents=[];
   enterPlay('THEM');
 }
 
@@ -1312,22 +1439,28 @@ function applyGuestCommand(c){
 function sendSnapshot(){
   const S=App.S;if(!S||!App.net)return;
   const meta={q:++App.seq,ph:App.phase,ep:App.epoch,ack:App.lastAck,pz:App.paused?1:0,rd:[App.ready.p1?1:0,App.ready.p2?1:0],gts:App.guestTs,g:App.net.other||null,E:App.netEvents};
-  let snap=encode(S,meta);
-  if(JSON.stringify(snap).length>3800){meta.E=App.netEvents.filter(e=>e[0]!=='txt'&&e[0]!=='fx').slice(-24);snap=encode(S,meta);if(JSON.stringify(snap).length>3800){meta.E=[];snap=encode(S,meta);}}
+  const fnow=nowSec();
+  const withS=S.sv!==App.sentSv||fnow-App.sentSvAt>STRUCT_RESEND;
+  let snap=encode(S,meta,withS);
+  if(JSON.stringify(snap).length>3800){meta.E=App.netEvents.filter(e=>e[0]!=='txt'&&e[0]!=='fx').slice(-24);snap=encode(S,meta,withS);if(JSON.stringify(snap).length>3800){meta.E=[];snap=encode(S,meta,withS);}}
+  if(withS){App.sentSv=S.sv;App.sentSvAt=fnow;}
   App.net.send(snap);
   App.netEvents=[];
 }
 function onHostMessage(m){
   if(!m||typeof m!=='object')return;
-  if(m.t==='full'){lobbyFail('That game already has two players.');return;}
+  if(m.k==='full'){lobbyFail('That game already has two players.');return;}
+  if(m.k==='adopt')return;
   if(!m.b||!App.G)return;
   if(m.g&&App.net&&App.net.me&&m.g!==App.net.me){if(App.phase==='lobby')lobbyFail('That game already has two players.');return;}
-  const V=decode(m);const fnow=nowSec();
+  const prev=App.G.cur?App.G.cur.structures:[];
+  const V=decode(m,prev);const fnow=nowSec();
+  if(m.S&&m.q>(App.G.sq||0))App.G.sq=m.q;else if(m.S)V.structures=App.G.cur?App.G.cur.structures:V.structures;
   if(Array.isArray(m.E))for(const e of m.E)applyEvent(e,'p2',V,fnow);
   if(m.ack)App.pendingCmds=App.pendingCmds.filter(c=>c[0]>m.ack);
   if(m.gts&&m.gts>0){const rtt=Date.now()-m.gts;if(rtt>=0&&rtt<2000)App.G.rtt=App.G.rtt?App.G.rtt*0.8+rtt*0.2:rtt;}
   if(m.q>App.G.q||m.ep!==App.G.epoch){App.G.cur=V;App.G.q=m.q;App.G.recvAt=fnow;App.G.paused=!!m.pz;App.G.rd=m.rd||[0,0];}
-  if(m.ep!==App.G.epoch){App.G.epoch=m.ep;App.G.ready=false;hideModal();if(m.ph==='play'){App.phase='lobby';enterPlay('THEM');}}
+  if(m.ep!==App.G.epoch){App.G.epoch=m.ep;App.G.ready=false;App.G.sq=m.S?m.q:0;if(!m.S)V.structures=[];App.G.cur=V;hideModal();if(m.ph==='play'){App.phase='lobby';enterPlay('THEM');}}
   if(m.ph==='play'&&App.phase!=='play'&&App.phase!=='over')enterPlay('THEM');
   if(m.ph==='over'&&App.phase==='play')onGameOver(V.winner);
   if(App.phase==='over'&&App.G.rd&&App.G.rd[0]&&!App.G.ready)UI.modalStatus.textContent='The other player wants a rematch.';
